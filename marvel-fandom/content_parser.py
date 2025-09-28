@@ -20,10 +20,11 @@ except ImportError:
 # ==============================
 # Константы для парсинга контента
 # ==============================
-INPUT_DIR = "marvel-fandom/output"  # Каталог с JSON файлами со списками
-OUTPUT_DIR = "marvel-fandom/parsed_content"  # Выходной каталог
+INPUT_DIR = "marvel-fandom-en"  # Каталог с JSON файлами со списками
+OUTPUT_DIR = "marvel-fandom-en/parsed_content"  # Выходной каталог
 MAIN_CONTENT_SELECTOR = "body > div.main-container > div.resizable-container > div.page.has-right-rail > main"
 BASE_URL = "https://marvel.fandom.com"
+ERROR_LOG_FILE = "marvel-fandom-en/parsing_errors.log"  # Файл для лога ошибок
 
 # Настройки времени паузы
 SHORT_PAUSE_MIN = 3  # Минимальная пауза между запросами (секунды)
@@ -31,6 +32,85 @@ SHORT_PAUSE_MAX = 5  # Максимальная пауза между запро
 LONG_PAUSE_MIN = 10   # Минимальная длинная пауза (секунды)
 LONG_PAUSE_MAX = 25  # Максимальная длинная пауза (секунды)
 PAGES_BEFORE_LONG_PAUSE = 10  # Количество страниц перед длинной паузой
+
+def generate_safe_filename(title: str, index: int) -> str:
+    """Сгенерировать безопасное имя файла из названия страницы."""
+    import re
+    
+    if not title or not title.strip():
+        return f"page_{index}_untitled"
+    
+    original_title = title
+    
+    # Заменяем проблемные символы на безопасные
+    safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)  # Запрещенные символы Windows
+    safe_title = re.sub(r'[\'"!@#$%^&*()+=\[\]{};:\'",.<>?/\\|`~]', '_', safe_title)  # Дополнительные символы
+    safe_title = re.sub(r'\s+', '_', safe_title)  # Заменяем пробелы на подчеркивания
+    safe_title = re.sub(r'_+', '_', safe_title)  # Убираем множественные подчеркивания
+    safe_title = safe_title.strip('_')  # Убираем подчеркивания в начале и конце
+    
+    # Оставляем только безопасные символы
+    safe_title = "".join(c for c in safe_title if c.isalnum() or c in ('-', '_')).rstrip()
+    
+    # Если после очистки ничего не осталось, используем индекс
+    if not safe_title:
+        safe_title = f"page_{index}"
+    elif len(safe_title) < 3:
+        safe_title = f"page_{index}_{safe_title}"
+    
+    # Ограничиваем длину
+    safe_title = safe_title[:100]
+    
+    # Логируем, если имя сильно изменилось
+    if safe_title != original_title.replace(' ', '_'):
+        print(f"⚠️ Имя файла изменено: '{original_title[:50]}...' -> '{safe_title}'")
+    
+    return safe_title
+
+def check_existing_files(title: str, index: int, output_subdir: str) -> tuple:
+    """
+    Проверить существует ли файл с данным названием в различных форматах.
+    Возвращает кортеж (exists: bool, existing_filename: str or None, safe_filename: str, has_error: bool)
+    """
+    import re
+    # Генерируем безопасное имя
+    safe_filename = generate_safe_filename(title, index)
+    safe_filepath = os.path.join(output_subdir, f"{safe_filename}.json")
+    
+    # Проверяем существование файла с безопасным именем
+    if os.path.exists(safe_filepath):
+        has_error = check_file_has_error(safe_filepath)
+        return True, safe_filename, safe_filename, has_error
+    
+    # Проверяем существование файла с оригинальным именем (старый формат)
+    old_safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).rstrip()
+    old_safe_title = old_safe_title.replace(' ', '_')[:100]
+    old_filepath = os.path.join(output_subdir, f"{old_safe_title}.json")
+    
+    if os.path.exists(old_filepath):
+        has_error = check_file_has_error(old_filepath)
+        return True, old_safe_title, safe_filename, has_error
+    
+    # Проверяем другие возможные варианты имен
+    # Вариант с заменой только основных запрещенных символов
+    basic_safe = re.sub(r'[<>:"/\\|?*]', '_', title)
+    basic_safe = basic_safe.replace(' ', '_')[:100]
+    basic_filepath = os.path.join(output_subdir, f"{basic_safe}.json")
+    
+    if os.path.exists(basic_filepath):
+        has_error = check_file_has_error(basic_filepath)
+        return True, basic_safe, safe_filename, has_error
+    
+    return False, None, safe_filename, False
+
+def check_file_has_error(filepath: str) -> bool:
+    """Проверить, содержит ли файл ошибку."""
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = json.load(f)
+        return 'error' in content
+    except:
+        return False
 
 def setup_selenium_driver():
     """Настроить Selenium WebDriver для парсинга."""
@@ -129,10 +209,51 @@ def parse_main_content(html: str) -> dict:
         content_parts = []
         while current and current.name not in ["h2", "h3", "h4"]:
             if current.name == "p":
-                content_parts.append(current.get_text(strip=True))
+                # Абзацы
+                text = current.get_text(strip=True)
+                if text:
+                    content_parts.append(text)
             elif current.name in ["ul", "ol"]:
+                # Списки
                 items = [li.get_text(strip=True) for li in current.find_all("li")]
-                content_parts.extend(items)
+                if items:
+                    content_parts.extend(items)
+            elif current.name == "div":
+                # Дивы с контентом (например, цитаты, таблицы, блоки сноски)
+                text = current.get_text(strip=True)
+                if text:
+                    content_parts.append(text)
+            elif current.name == "table":
+                # Таблицы
+                rows = []
+                for row in current.find_all("tr"):
+                    cells = [cell.get_text(strip=True) for cell in row.find_all(["td", "th"])]
+                    if cells:
+                        rows.append(" | ".join(cells))
+                if rows:
+                    content_parts.append("Таблица:\n" + "\n".join(rows))
+            elif current.name == "blockquote":
+                # Цитаты
+                text = current.get_text(strip=True)
+                if text:
+                    content_parts.append(f"Цитата: {text}")
+            elif current.name == "dl":
+                # Списки определений
+                terms = []
+                for dt in current.find_all("dt"):
+                    term = dt.get_text(strip=True)
+                    dd = dt.find_next_sibling("dd")
+                    if dd:
+                        definition = dd.get_text(strip=True)
+                        terms.append(f"{term}: {definition}")
+                if terms:
+                    content_parts.extend(terms)
+            elif current.name == "pre":
+                # Преформатированный текст
+                text = current.get_text(strip=True)
+                if text:
+                    content_parts.append(f"Код/Преформатированный текст: {text}")
+            
             current = current.find_next_sibling()
         
         section_data["content"] = "\n".join(content_parts)
@@ -142,9 +263,19 @@ def parse_main_content(html: str) -> dict:
     paragraphs = main_content.find_all("p", limit=10)
     content_data["main_content"] = "\n".join([p.get_text(strip=True) for p in paragraphs if p.get_text(strip=True)])
     
-    # Категории
-    categories = soup.find_all("a", href=lambda x: x and "/wiki/Категория:" in x)
-    content_data["categories"] = list(set([cat.get_text(strip=True) for cat in categories]))
+    # Категории - ищем во всем документе, а не только в main_content
+    categories = []
+    
+    # Ищем категории на русском языке
+    russian_category_links = soup.find_all("a", href=lambda x: x and "/wiki/Категория:" in x)
+    categories.extend([cat.get_text(strip=True) for cat in russian_category_links])
+    
+    # Ищем категории на английском языке
+    english_category_links = soup.find_all("a", href=lambda x: x and "/wiki/Category:" in x)
+    categories.extend([cat.get_text(strip=True) for cat in english_category_links])
+    
+    # Убираем дубликаты и пустые значения
+    content_data["categories"] = list(set([cat for cat in categories if cat]))
     
     return content_data
 
@@ -156,6 +287,13 @@ def parse_infobox(infobox) -> dict:
     title_elem = infobox.find("h2", class_="pi-item pi-title")
     if title_elem:
         infobox_data["name"] = title_elem.get_text(strip=True)
+    
+    # Изображение инфобокса
+    image_elem = infobox.find("figure", class_="pi-item pi-image")
+    if image_elem:
+        img = image_elem.find("img")
+        if img and img.get("src"):
+            infobox_data["image"] = img.get("src")
     
     # Группы данных
     groups = infobox.find_all("section", class_="pi-item pi-group")
@@ -173,8 +311,39 @@ def parse_infobox(infobox) -> dict:
                 if label and value:
                     key = label.get_text(strip=True).rstrip(":")
                     infobox_data[group_name][key] = value.get_text(strip=True)
+                else:
+                    # Обработка элементов без явного лейбла (например, "Занятие:", "Организации:")
+                    value_div = item.find("div", class_="pi-data-value")
+                    if value_div:
+                        text = value_div.get_text(strip=True)
+                        if ":" in text:
+                            parts = text.split(":", 1)
+                            key = parts[0].strip()
+                            value = parts[1].strip()
+                            infobox_data[group_name][key] = value
+    
+    # Одиночные элементы данных (не в группах)
+    standalone_items = infobox.find_all("div", class_="pi-item pi-data")
+    for item in standalone_items:
+        if not item.find_parent("section", class_="pi-item pi-group"):
+            label = item.find("h3", class_="pi-data-label")
+            value = item.find("div", class_="pi-data-value")
+            if label and value:
+                key = label.get_text(strip=True).rstrip(":")
+                infobox_data[key] = value.get_text(strip=True)
     
     return infobox_data
+
+def log_error(url: str, title: str, error_message: str):
+    """Записать ошибку в лог файл."""
+    try:
+        os.makedirs(os.path.dirname(ERROR_LOG_FILE), exist_ok=True)
+        with open(ERROR_LOG_FILE, 'a', encoding='utf-8') as f:
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"[{timestamp}] {title} ({url}): {error_message}\n")
+        print(f"✗ Ошибка записана в лог: {title}")
+    except Exception as e:
+        print(f"✗ Ошибка при записи в лог файл: {e}")
 
 def is_file_fully_processed(json_file_path: str) -> bool:
     """Проверить, обработан ли весь файл (все ссылки из JSON)."""
@@ -209,9 +378,10 @@ def is_file_fully_processed(json_file_path: str) -> bool:
     # Проверяем, совпадает ли количество обработанных файлов с количеством ссылок
     return len(processed_files) >= len(links_data)
 
-def process_json_file(json_file_path: str, driver) -> None:
-    """Обработать один JSON файл со списком ссылок."""
+def process_json_file(json_file_path: str, driver) -> int:
+    """Обработать один JSON файл со списком ссылок. Возвращает количество обработанных страниц."""
     print(f"\nОбработка файла: {json_file_path}")
+    processed_count = 0
     
     # Проверяем существование входного файла
     if not os.path.exists(json_file_path):
@@ -261,16 +431,17 @@ def process_json_file(json_file_path: str, driver) -> None:
         url = item['url']
         title = item.get('title', f'item_{i}')
         
-        # Очищаем название для использования в имени файла
-        safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).rstrip()
-        safe_title = safe_title.replace(' ', '_')[:100]  # Ограничиваем длину
+        # Проверяем существование файла в различных форматах имен
+        exists, existing_filename, safe_filename, has_error = check_existing_files(title, i, output_subdir)
         
-        output_file = os.path.join(output_subdir, f"{safe_title}.json")
-        
-        # Проверяем, не обработана ли уже эта страница
-        if os.path.exists(output_file):
-            print(f"Пропуск {title}: уже обработано")
+        if exists and not has_error:
+            print(f"Пропуск {title}: уже обработано как '{existing_filename}'")
             continue
+        elif exists and has_error:
+            print(f"Перезапись {title}: файл содержит ошибку")
+        
+        # Используем безопасное имя для нового файла
+        output_file = os.path.join(output_subdir, f"{safe_filename}.json")
         
         try:
             # Загружаем страницу
@@ -291,40 +462,35 @@ def process_json_file(json_file_path: str, driver) -> None:
                 
                 with open(output_file, 'w', encoding='utf-8') as f:
                     json.dump(content_data, f, ensure_ascii=False, indent=2)
+                
+                # Проверяем, что файл действительно создан
+                if os.path.exists(output_file):
+                    file_size = os.path.getsize(output_file)
+                    percentage = (i + 1) / len(links_data) * 100
+                    print(f"✓ Сохранено: {title} ({i+1}/{len(links_data)}) - {percentage:.1f}% - {file_size} байт")
+                else:
+                    print(f"✗ Ошибка: файл не был создан: {output_file}")
+                    raise Exception(f"Файл не был создан: {output_file}")
+                    
             except Exception as e:
-                print(f"Ошибка при сохранении файла {output_file}: {e}")
+                print(f"✗ Ошибка при сохранении файла {output_file}: {e}")
                 raise
             
-            print(f"✓ Обработано: {title} ({i+1}/{len(links_data)})")
-            
+            processed_count += 1
             # Случайная задержка между запросами
             time.sleep(random.uniform(SHORT_PAUSE_MIN, SHORT_PAUSE_MAX))
             
         except Exception as e:
             print(f"✗ Ошибка при обработке {title}: {e}")
-            # Создаем файл с ошибкой
-            error_data = {
-                "error": str(e),
-                "url": url,
-                "title": title,
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-            }
-            try:
-                # Создаем родительские каталоги если их нет
-                output_dir = os.path.dirname(output_file)
-                if output_dir and not os.path.exists(output_dir):
-                    os.makedirs(output_dir, exist_ok=True)
-                    print(f"Создан каталог: {output_dir}")
-                
-                with open(output_file, 'w', encoding='utf-8') as f:
-                    json.dump(error_data, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                print(f"Ошибка при сохранении файла с ошибкой {output_file}: {e}")
+            # Записываем ошибку в лог файл
+            log_error(url, title, str(e))
         
         # Каждые N страниц делаем длинную паузу
         if (i + 1) % PAGES_BEFORE_LONG_PAUSE == 0:
             print(f"Длинная пауза после {i + 1} страниц...")
             time.sleep(random.uniform(LONG_PAUSE_MIN, LONG_PAUSE_MAX))
+    
+    return processed_count
 
 def main():
     """Основная функция."""
@@ -358,12 +524,25 @@ def main():
     
     # Настраиваем Selenium драйвер
     driver = None
+    total_expected = 0
+    total_processed = 0
+    
     try:
         driver = setup_selenium_driver()
         
         # Обрабатываем каждый JSON файл
         for json_file in json_files:
-            process_json_file(json_file, driver)
+            processed_count = process_json_file(json_file, driver)
+            total_processed += processed_count
+            
+            # Подсчитываем общее количество ожидаемых файлов
+            try:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    links_data = json.load(f)
+                    if isinstance(links_data, list):
+                        total_expected += len(links_data)
+            except:
+                pass
             
     except KeyboardInterrupt:
         print("\nПрервано пользователем")
@@ -373,6 +552,26 @@ def main():
         if driver:
             driver.quit()
             print("Драйвер закрыт")
+    
+    # Подсчитываем фактическое количество файлов
+    actual_files = 0
+    for json_file in json_files:
+        file_name = Path(json_file).stem
+        output_subdir = os.path.join(OUTPUT_DIR, file_name)
+        if os.path.exists(output_subdir):
+            files_in_dir = [f for f in os.listdir(output_subdir) if f.endswith('.json')]
+            actual_files += len(files_in_dir)
+    
+    print(f"\n=== СТАТИСТИКА ===")
+    print(f"Ожидаемое количество файлов: {total_expected}")
+    print(f"Обработано страниц: {total_processed}")
+    print(f"Фактическое количество файлов: {actual_files}")
+    print(f"Разница: {total_expected - actual_files}")
+    
+    if total_expected != actual_files:
+        print(f"⚠️ Внимание: разница в {total_expected - actual_files} файлах!")
+    else:
+        print("✓ Все файлы успешно сохранены!")
     
     print("\nОбработка завершена!")
 
