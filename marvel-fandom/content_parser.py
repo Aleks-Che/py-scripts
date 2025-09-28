@@ -27,10 +27,10 @@ BASE_URL = "https://marvel.fandom.com"
 ERROR_LOG_FILE = "marvel-fandom-en/parsing_errors.log"  # Файл для лога ошибок
 
 # Настройки времени паузы
-SHORT_PAUSE_MIN = 3  # Минимальная пауза между запросами (секунды)
-SHORT_PAUSE_MAX = 5  # Максимальная пауза между запросами (секунды)
-LONG_PAUSE_MIN = 10   # Минимальная длинная пауза (секунды)
-LONG_PAUSE_MAX = 25  # Максимальная длинная пауза (секунды)
+SHORT_PAUSE_MIN = 10  # Минимальная пауза между запросами (секунды)
+SHORT_PAUSE_MAX = 15  # Максимальная пауза между запросами (секунды)
+LONG_PAUSE_MIN = 20   # Минимальная длинная пауза (секунды)
+LONG_PAUSE_MAX = 35  # Максимальная длинная пауза (секунды)
 PAGES_BEFORE_LONG_PAUSE = 10  # Количество страниц перед длинной паузой
 
 def generate_safe_filename(title: str, index: int) -> str:
@@ -172,6 +172,24 @@ def parse_main_content(html: str) -> dict:
             main_content = soup.find("div", id="content")
             if not main_content:
                 print("Предупреждение: не найден основной контент по селекторам")
+                # Для страниц-галерей и других специальных страниц
+                page_title = soup.find("h1", id="firstHeading") or soup.find("h1", class_="page-header__title")
+                title_text = page_title.get_text(strip=True) if page_title else "Unknown"
+                
+                # Проверяем, является ли это страницей-галереей
+                if "/Gallery" in title_text or "Gallery" in title_text:
+                    gallery_content = soup.find("div", class_="wikia-gallery")
+                    if gallery_content:
+                        return {
+                            "title": title_text,
+                            "url": "",
+                            "main_content": "This is a gallery page with images",
+                            "sections": [{"level": 2, "title": "Gallery", "content": "Image gallery content"}],
+                            "infobox": {},
+                            "categories": ["Gallery"],
+                            "raw_html": str(soup.find("body"))[:500]
+                        }
+                
                 return {"error": "Main content not found", "html_snippet": str(soup.find("body"))[:500]}
     
     # Извлекаем текстовое содержимое
@@ -195,19 +213,171 @@ def parse_main_content(html: str) -> dict:
     if infobox:
         content_data["infobox"] = parse_infobox(infobox)
     
-    # Секции статьи
+    # Секции статьи - улучшенная версия
     sections = main_content.find_all(["h2", "h3", "h4"])
     for section in sections:
+        section_title = section.get_text(strip=True)
         section_data = {
             "level": int(section.name[1]),
-            "title": section.get_text(strip=True),
+            "title": section_title,
             "content": ""
         }
         
-        # Собираем контент до следующего заголовка
-        current = section.find_next_sibling()
-        content_parts = []
-        while current and current.name not in ["h2", "h3", "h4"]:
+        # Специальная обработка для секции "Contents"
+        if section_title.lower() == "contents":
+            # Ищем оглавление внутри секции
+            toc_links = section.find_next_sibling("ul") or section.find_next_sibling("div", class_="toc")
+            if not toc_links:
+                # Ищем внутри div с классом toc
+                toc_div = main_content.find("div", class_="toc")
+                if toc_div:
+                    toc_links = toc_div
+            
+            if toc_links:
+                toc_items = []
+                links = toc_links.find_all("a")
+                for link in links:
+                    link_text = link.get_text(strip=True)
+                    if link_text and not link_text.startswith('[') and len(link_text) > 2:
+                        toc_items.append(link_text)
+                if toc_items:
+                    section_data["content"] = "\n".join(toc_items)
+        
+        # Специальная обработка для секции "First"
+        elif section_title.lower() == "first":
+            # Ищем информацию о первом появлении в различных местах
+            first_info = section.find_next_sibling("div", class_="pi-smart-data-value")
+            if not first_info:
+                # Ищем в родительском контейнере
+                parent_section = section.find_parent("section", class_="pi-smart-group")
+                if parent_section:
+                    first_info = parent_section.find("div", class_="pi-smart-data-value")
+            
+            if first_info:
+                first_text = first_info.get_text(strip=True)
+                if first_text:
+                    section_data["content"] = first_text
+        
+        # Специальная обработка для секции "Links and References"
+        elif "links" in section_title.lower() or "references" in section_title.lower():
+            # Ищем ссылки и сноски
+            ref_links = section.find_next_sibling("div", class_="mw-references-wrap")
+            if ref_links:
+                ref_items = []
+                ref_items_elements = ref_links.find_all("span", class_="reference-text")
+                for ref_item in ref_items_elements:
+                    ref_text = ref_item.get_text(strip=True)
+                    if ref_text:
+                        ref_items.append(ref_text)
+                if ref_items:
+                    section_data["content"] = "\n".join(ref_items[:10])  # Ограничиваем количество сносок
+        
+        # Для всех других секций используем стандартную обработку
+        else:
+            # Собираем контент до следующего заголовка
+            current = section.find_next_sibling()
+            content_parts = []  # Инициализируем переменную здесь
+            while current:
+                # Проверяем, является ли текущий элемент заголовком
+                if current.name in ["h2", "h3", "h4"]:
+                    break
+                
+                # Проверяем, что current не None и имеет атрибут name
+                if not hasattr(current, 'name'):
+                    # Безопасно переходим к следующему элементу
+                    next_sibling = current.find_next_sibling()
+                    if next_sibling is None:
+                        break
+                    current = next_sibling
+                    continue
+                if current.name == "p":
+                    # Абзацы
+                    text = current.get_text(strip=True)
+                    if text:
+                        content_parts.append(text)
+                elif current.name in ["ul", "ol"]:
+                    # Списки
+                    items = [li.get_text(strip=True) for li in current.find_all("li")]
+                    if items:
+                        content_parts.extend(items)
+                elif current.name == "div":
+                    # Дивы с контентом - улучшенная обработка
+                    # Проверяем различные классы дивов, которые могут содержать контент
+                    div_classes = current.get('class', [])
+                    div_text = current.get_text(strip=True)
+                    
+                    # Специальная обработка для различных типов div'ов
+                    if 'mw-collapsible-content' in div_classes:
+                        # Раскрывающийся контент
+                        if div_text:
+                            content_parts.append(div_text)
+                    elif 'marvel_database_section' in div_classes:
+                        # Секции Marvel Database
+                        if div_text:
+                            content_parts.append(div_text)
+                    elif 'pi-smart-group-body' in div_classes:
+                        # Инфобокс группы
+                        if div_text:
+                            content_parts.append(div_text)
+                    elif 'thumbcaption' in div_classes:
+                        # Подписи к изображениям
+                        if div_text:
+                            content_parts.append(f"Изображение: {div_text}")
+                    else:
+                        # Обычные дивы
+                        if div_text and len(div_text) > 10:  # Фильтруем очень короткий текст
+                            content_parts.append(div_text)
+                elif current.name == "table":
+                    # Таблицы
+                    rows = []
+                    for row in current.find_all("tr"):
+                        cells = [cell.get_text(strip=True) for cell in row.find_all(["td", "th"])]
+                        if cells:
+                            rows.append(" | ".join(cells))
+                    if rows:
+                        content_parts.append("Таблица:\n" + "\n".join(rows))
+                elif current.name == "blockquote":
+                    # Цитаты
+                    text = current.get_text(strip=True)
+                    if text:
+                        content_parts.append(f"Цитата: {text}")
+                elif current.name == "dl":
+                    # Списки определений
+                    terms = []
+                    for dt in current.find_all("dt"):
+                        term = dt.get_text(strip=True)
+                        dd = dt.find_next_sibling("dd")
+                        if dd:
+                            definition = dd.get_text(strip=True)
+                            terms.append(f"{term}: {definition}")
+                    if terms:
+                        content_parts.extend(terms)
+                elif current.name == "pre":
+                    # Преформатированный текст
+                    text = current.get_text(strip=True)
+                    if text:
+                        content_parts.append(f"Код/Преформатированный текст: {text}")
+                elif current.name == "figure":
+                    # Изображения с подписями
+                    caption = current.find("figcaption")
+                    if caption:
+                        caption_text = caption.get_text(strip=True)
+                        if caption_text:
+                            content_parts.append(f"Изображение: {caption_text}")
+                elif current.name == "span":
+                    # Спаны с классами, которые могут содержать важный контент
+                    span_classes = current.get('class', [])
+                    span_text = current.get_text(strip=True)
+                    if span_text and ('mw-page-title-main' in span_classes or 'mw-headline' in span_classes):
+                        content_parts.append(span_text)
+                
+                # Безопасно переходим к следующему элементу
+                next_sibling = current.find_next_sibling()
+                if next_sibling is None:
+                    break
+                current = next_sibling
+            
+            section_data["content"] = "\n".join(content_parts) if content_parts else ""
             if current.name == "p":
                 # Абзацы
                 text = current.get_text(strip=True)
@@ -219,10 +389,32 @@ def parse_main_content(html: str) -> dict:
                 if items:
                     content_parts.extend(items)
             elif current.name == "div":
-                # Дивы с контентом (например, цитаты, таблицы, блоки сноски)
-                text = current.get_text(strip=True)
-                if text:
-                    content_parts.append(text)
+                # Дивы с контентом - улучшенная обработка
+                # Проверяем различные классы дивов, которые могут содержать контент
+                div_classes = current.get('class', [])
+                div_text = current.get_text(strip=True)
+                
+                # Специальная обработка для различных типов div'ов
+                if 'mw-collapsible-content' in div_classes:
+                    # Раскрывающийся контент
+                    if div_text:
+                        content_parts.append(div_text)
+                elif 'marvel_database_section' in div_classes:
+                    # Секции Marvel Database
+                    if div_text:
+                        content_parts.append(div_text)
+                elif 'pi-smart-group-body' in div_classes:
+                    # Инфобокс группы
+                    if div_text:
+                        content_parts.append(div_text)
+                elif 'thumbcaption' in div_classes:
+                    # Подписи к изображениям
+                    if div_text:
+                        content_parts.append(f"Изображение: {div_text}")
+                else:
+                    # Обычные дивы
+                    if div_text and len(div_text) > 10:  # Фильтруем очень короткий текст
+                        content_parts.append(div_text)
             elif current.name == "table":
                 # Таблицы
                 rows = []
@@ -253,15 +445,61 @@ def parse_main_content(html: str) -> dict:
                 text = current.get_text(strip=True)
                 if text:
                     content_parts.append(f"Код/Преформатированный текст: {text}")
+            elif current.name == "figure":
+                # Изображения с подписями
+                caption = current.find("figcaption")
+                if caption:
+                    caption_text = caption.get_text(strip=True)
+                    if caption_text:
+                        content_parts.append(f"Изображение: {caption_text}")
+            elif current.name == "span":
+                # Спаны с классами, которые могут содержать важный контент
+                span_classes = current.get('class', [])
+                span_text = current.get_text(strip=True)
+                if span_text and ('mw-page-title-main' in span_classes or 'mw-headline' in span_classes):
+                    content_parts.append(span_text)
             
             current = current.find_next_sibling()
         
         section_data["content"] = "\n".join(content_parts)
         content_data["sections"].append(section_data)
     
-    # Основной текст (первые несколько абзацев)
-    paragraphs = main_content.find_all("p", limit=10)
-    content_data["main_content"] = "\n".join([p.get_text(strip=True) for p in paragraphs if p.get_text(strip=True)])
+    # Основной текст (первые несколько абзацев) - улучшенная версия
+    main_content_parts = []
+    
+    # Сначала ищем основной текст в различных контейнерах
+    # Проверяем div с классом marvel_database_section
+    main_sections = main_content.find_all("div", class_="marvel_database_section")
+    for section in main_sections:
+        section_text = section.get_text(strip=True)
+        if section_text:
+            main_content_parts.append(section_text)
+    
+    # Если не нашли специальные секции, используем обычные абзацы
+    if not main_content_parts:
+        paragraphs = main_content.find_all("p", limit=15)
+        for p in paragraphs:
+            text = p.get_text(strip=True)
+            if text and len(text) > 10:  # Фильтруем очень короткий текст
+                main_content_parts.append(text)
+    
+    # Также ищем контент в раскрывающихся блоках
+    collapsible_blocks = main_content.find_all("div", class_="mw-collapsible-content")
+    for block in collapsible_blocks:
+        block_text = block.get_text(strip=True)
+        if block_text and len(block_text) > 20:
+            main_content_parts.append(f"[Раскрывающийся контент]: {block_text}")
+    
+    # Ищем контент в figure с подписями
+    figures = main_content.find_all("figure", class_="thumb")
+    for figure in figures:
+        caption = figure.find("figcaption")
+        if caption:
+            caption_text = caption.get_text(strip=True)
+            if caption_text:
+                main_content_parts.append(f"[Изображение]: {caption_text}")
+    
+    content_data["main_content"] = "\n".join(main_content_parts)
     
     # Категории - ищем во всем документе, а не только в main_content
     categories = []
