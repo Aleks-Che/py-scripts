@@ -30,7 +30,7 @@ ERROR_LOG_FILE = "marvel-fandom-en/parsing_errors.log"  # Файл для лог
 SHORT_PAUSE_MIN = 10  # Минимальная пауза между запросами (секунды)
 SHORT_PAUSE_MAX = 15  # Максимальная пауза между запросами (секунды)
 LONG_PAUSE_MIN = 20   # Минимальная длинная пауза (секунды)
-LONG_PAUSE_MAX = 35  # Максимальная длинная пауза (секунды)
+LONG_PAUSE_MAX = 30  # Максимальная длинная пауза (секунды)
 PAGES_BEFORE_LONG_PAUSE = 10  # Количество страниц перед длинной паузой
 
 def generate_safe_filename(title: str, index: int) -> str:
@@ -210,12 +210,62 @@ def parse_main_content(html: str) -> dict:
     
     # Инфобокс (если есть)
     infobox = main_content.find("aside", class_="portable-infobox")
+    infobox_data = {}
     if infobox:
-        content_data["infobox"] = parse_infobox(infobox)
-    # Секции статьи - улучшенная версия
+        infobox_data = parse_infobox(infobox)
+        content_data["infobox"] = infobox_data
+    # Создаем словарь для быстрого поиска данных из инфобокса по заголовкам
+    infobox_lookup = {}
+    if infobox_data:
+        # Добавляем данные из основных полей инфобокса
+        for key, value in infobox_data.items():
+            if isinstance(value, dict):
+                for sub_key, sub_value in value.items():
+                    infobox_lookup[sub_key.lower()] = str(sub_value)
+            else:
+                infobox_lookup[key.lower()] = str(value)
+        
+        # Добавляем специальные mapping для распространенных полей
+        field_mappings = {
+            'name': ['name', 'title'],
+            'current alias': ['currentalias', 'alias'],
+            'gender': ['gender'],
+            'date of birth': ['dateofbirth', 'birth'],
+            'living status': ['status', 'livingstatus'],
+            'identity': ['identity'],
+            'citizenship': ['citizenship'],
+            'occupation': ['occupation'],
+            'marital status': ['maritalstatus'],
+            'eyes': ['eyes'],
+            'hair': ['hair'],
+            'reality': ['reality'],
+            'origin': ['origin'],
+            'first work': ['first', 'firstwork'],
+            'employers': ['employers'],
+            'titles': ['titles']
+        }
+        
+        # Создаем расширенный lookup с учетом mapping
+        extended_lookup = {}
+        for display_key, possible_keys in field_mappings.items():
+            for possible_key in possible_keys:
+                if possible_key in infobox_lookup:
+                    extended_lookup[display_key] = infobox_lookup[possible_key]
+                    break
+        infobox_lookup.update(extended_lookup)
+
+    # Секции статьи - улучшенная версия с учетом инфобокса
     sections = main_content.find_all(["h2", "h3", "h4"])
+    processed_sections = set()  # Для предотвращения дублирования
+    
     for section in sections:
         section_title = section.get_text(strip=True)
+        
+        # Пропускаем дублирующиеся секции
+        if section_title in processed_sections:
+            continue
+        processed_sections.add(section_title)
+        
         section_data = {
             "level": int(section.name[1]),
             "title": section_title,
@@ -225,8 +275,13 @@ def parse_main_content(html: str) -> dict:
         # Инициализируем content_parts для всех случаев
         content_parts = []
         
+        # Проверяем, есть ли данные в инфобоксе для этой секции
+        section_title_lower = section_title.lower()
+        if section_title_lower in infobox_lookup:
+            content_parts.append(infobox_lookup[section_title_lower])
+        
         # Специальная обработка для секции "Contents"
-        if section_title.lower() == "contents":
+        if section_title_lower == "contents":
             # Ищем оглавление внутри секции
             toc_links = section.find_next_sibling("ul") or section.find_next_sibling("div", class_="toc")
             if not toc_links:
@@ -246,7 +301,7 @@ def parse_main_content(html: str) -> dict:
                     content_parts.extend(toc_items)
         
         # Специальная обработка для секции "First"
-        elif section_title.lower() == "first":
+        elif section_title_lower == "first":
             # Ищем информацию о первом появлении в различных местах
             first_info = section.find_next_sibling("div", class_="pi-smart-data-value")
             if not first_info:
@@ -261,7 +316,7 @@ def parse_main_content(html: str) -> dict:
                     content_parts.append(first_text)
         
         # Специальная обработка для секции "Links and References"
-        elif "links" in section_title.lower() or "references" in section_title.lower():
+        elif "links" in section_title_lower or "references" in section_title_lower:
             # Ищем ссылки и сноски
             ref_links = section.find_next_sibling("div", class_="mw-references-wrap")
             if ref_links:
@@ -452,42 +507,38 @@ def parse_infobox(infobox) -> dict:
         if img and img.get("src"):
             infobox_data["image"] = img.get("src")
     
-    # Группы данных
-    groups = infobox.find_all("section", class_="pi-item pi-group")
-    for group in groups:
-        group_title = group.find("h2", class_="pi-header")
-        if group_title:
-            group_name = group_title.get_text(strip=True)
-            infobox_data[group_name] = {}
-            
-            # Поля в группе
-            items = group.find_all("div", class_="pi-item pi-data")
-            for item in items:
-                label = item.find("h3", class_="pi-data-label")
-                value = item.find("div", class_="pi-data-value")
-                if label and value:
-                    key = label.get_text(strip=True).rstrip(":")
-                    infobox_data[group_name][key] = value.get_text(strip=True)
-                else:
-                    # Обработка элементов без явного лейбла (например, "Занятие:", "Организации:")
-                    value_div = item.find("div", class_="pi-data-value")
-                    if value_div:
-                        text = value_div.get_text(strip=True)
-                        if ":" in text:
-                            parts = text.split(":", 1)
-                            key = parts[0].strip()
-                            value = parts[1].strip()
-                            infobox_data[group_name][key] = value
+    # Ищем все элементы с data-source атрибутом
+    data_items = infobox.find_all(attrs={"data-source": True})
     
-    # Одиночные элементы данных (не в группах)
-    standalone_items = infobox.find_all("div", class_="pi-item pi-data")
-    for item in standalone_items:
-        if not item.find_parent("section", class_="pi-item pi-group"):
-            label = item.find("h3", class_="pi-data-label")
-            value = item.find("div", class_="pi-data-value")
-            if label and value:
-                key = label.get_text(strip=True).rstrip(":")
-                infobox_data[key] = value.get_text(strip=True)
+    for item in data_items:
+        data_source = item.get("data-source", "")
+        
+        # Пропускаем заголовок и изображение (уже обработаны выше)
+        if data_source in ["Title", "Image"]:
+            continue
+            
+        # Получаем лейбл и значение
+        label = item.find("h3", class_="pi-data-label")
+        value = item.find("div", class_="pi-data-value")
+        
+        if label and value:
+            key = label.get_text(strip=True).rstrip(":")
+            infobox_data[key] = value.get_text(strip=True)
+        elif value:
+            # Если есть только значение без лейбла, используем data-source как ключ
+            key = data_source.replace("Of", " of ").replace("Status", " Status")
+            # Преобразуем CamelCase в нормальный текст
+            import re
+            key = re.sub(r'([A-Z])', r' \1', key).strip()
+            infobox_data[key] = value.get_text(strip=True)
+        else:
+            # Если нет div с классом pi-data-value, пробуем весь текст элемента
+            text = item.get_text(strip=True)
+            if text and data_source not in ["Title", "Image"]:
+                key = data_source.replace("Of", " of ").replace("Status", " Status")
+                import re
+                key = re.sub(r'([A-Z])', r' \1', key).strip()
+                infobox_data[key] = text
     
     return infobox_data
 
